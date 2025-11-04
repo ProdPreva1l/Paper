@@ -1,276 +1,200 @@
 package ca.spottedleaf.moonrise.common.time;
 
-import ca.spottedleaf.concurrentutil.util.TimeUtil;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
+import java.util.concurrent.TimeUnit;
 
+/**
+ * Originally the subclasses here were a lot nicer, they have now been squashed into ... something? but they have a much smaller memory footprint.
+ * Furthermore, originally this class was a lot cleaner, but this code is extremely hot, and therefore needs as small a footprint as possible.
+ * So I present, TickData revision 900
+ */
 public final class TickData {
-
     private final long interval; // ns
 
-    private final ArrayDeque<TickTime> timeData = new ArrayDeque<>();
+    // really simple circular buffer instead of that deque
+    private final TickTime[] buffer;
+    private final int capacity;
+    private int index = 0;
+
+    private long dumbTicksTotalTime = 0;
+    private long dumbTicksTotalCPUTime = 0;
+
+    // pre allocate our arrays
+    private final long[] preDiffFromLast;
+    private final long[] preTickTimes;
+    private final long[] preTickCpuTimes;
+    private final TickTime[] preSnap;
 
     public TickData(final long intervalNS) {
         this.interval = intervalNS;
+        this.capacity = (int) Math.max(40, TimeUnit.NANOSECONDS.toSeconds(intervalNS) * 40);
+        this.buffer = new TickTime[this.capacity];
+
+        this.preDiffFromLast = new long[this.capacity];
+        this.preTickTimes = new long[this.capacity];
+        this.preTickCpuTimes = new long[this.capacity];
+        this.preSnap = new TickTime[this.capacity];
     }
 
     public void addDataFrom(final TickTime time) {
-        final long start = time.tickStart();
-
-        TickTime first;
-        while ((first = this.timeData.peekFirst()) != null) {
-            // only remove data completely out of window
-            if ((start - first.tickEnd()) <= this.interval) {
-                break;
+        // aggregate dumb ticks
+        // this means that we are no longer as accurate as we previously were
+        // however this is accurate enough, if you disagree, go find a hill to cry on
+        if (!time.isTickExecution()) {
+            if (time.tickCpuTime() < 10_000 && time.tickLength() < 10_000) {
+                dumbTicksTotalTime += time.tickLength();
+                dumbTicksTotalCPUTime += time.tickCpuTime();
+                return;
             }
-            this.timeData.pollFirst();
         }
 
-        this.timeData.add(time);
+        buffer[index % capacity] = time;
+        ++index;
     }
 
-    // fromIndex inclusive, toIndex exclusive
-    // will throw if arr.length == 0
-    private static double median(final long[] arr, final int fromIndex, final int toIndex) {
-        final int len = toIndex - fromIndex;
-        final int middle = fromIndex + (len >>> 1);
-        if ((len & 1) == 0) {
-            // even, average the two middle points
-            return (double)(arr[middle - 1] + arr[middle]) / 2.0;
+    private TickTime[] snapshot() {
+        if (index <= capacity) {
+            System.arraycopy(buffer, 0, preSnap, 0, index);
+            Arrays.fill(preSnap, index, capacity, null);
         } else {
-            // odd, just grab the middle
-            return (double)arr[middle];
+            int start = index % capacity;
+            int firstLen = capacity - start;
+            System.arraycopy(buffer, start, preSnap, 0, firstLen);
+            System.arraycopy(buffer, 0, preSnap, firstLen, capacity - firstLen);
         }
+
+        return preSnap;
     }
 
-    // will throw if arr.length == 0
-    private static SegmentData computeSegmentData(final long[] arr, final int fromIndex, final int toIndex,
-                                                  final boolean inverse) {
-        final int len = toIndex - fromIndex;
-        long sum = 0L;
-        final double median = median(arr, fromIndex, toIndex);
-        long min = Long.MAX_VALUE;
-        long max = Long.MIN_VALUE;
-
-        for (int i = fromIndex; i < toIndex; ++i) {
-            final long val = arr[i];
-            sum += val;
-            min = Math.min(min, val);
-            max = Math.max(max, val);
-        }
-
-        if (inverse) {
-            // for positive a,b we have that a >= b if and only if 1/a <= 1/b
-            return new SegmentData(
-                len,
-                (double)len / ((double)sum / 1.0E9),
-                1.0E9 / median,
-                1.0E9 / (double)max,
-                1.0E9 / (double)min
-            );
-        } else {
-            return new SegmentData(
-                len,
-                (double)sum / (double)len,
-                median,
-                (double)min,
-                (double)max
-            );
-        }
+    public double getTPSAverage(final TickTime inProgress, final long tickInterval) {
+        return getTPSAverage(inProgress, tickInterval, false);
     }
 
-    private static SegmentedAverage computeSegmentedAverage(final long[] data, final int allStart, final int allEnd,
-                                                            final int percent99BestStart, final int percent99BestEnd,
-                                                            final int percent95BestStart, final int percent95BestEnd,
-                                                            final int percent1WorstStart, final int percent1WorstEnd,
-                                                            final int percent5WorstStart, final int percent5WorstEnd,
-                                                            final boolean inverse) {
-        return new SegmentedAverage(
-            computeSegmentData(data, allStart, allEnd, inverse),
-            computeSegmentData(data, percent99BestStart, percent99BestEnd, inverse),
-            computeSegmentData(data, percent95BestStart, percent95BestEnd, inverse),
-            computeSegmentData(data, percent1WorstStart, percent1WorstEnd, inverse),
-            computeSegmentData(data, percent5WorstStart, percent5WorstEnd, inverse),
-            data
-        );
+    public double getTPSAverage(TickTime inProgress, long tickInterval, boolean createFakeTick) {
+        TickTime[] times = snapshot();
+        if (times[0] == null && inProgress == null) return 1.0E9 / (double) tickInterval;
+
+        CollapsedData data = collapseData(times, inProgress, tickInterval, createFakeTick);
+        if (data.count == 0) return 1.0E9 / (double) tickInterval;
+
+        long total = 0L;
+        for (int i = 0; i < data.count; i++) total += data.diffFromLast[i];
+        return (double) data.count / ((double) total / 1.0E9);
     }
-
-    private static record TickInformation(
-        long differenceFromLastTick,
-        long tickTime,
-        long tickTimeCPU
-    ) {}
-
-    public Double getTPSAverage(final TickTime inProgress, final long tickInterval) {
-        return this.getTPSAverage(inProgress, tickInterval, false);
-    }
-
-    public Double getTPSAverage(final TickTime inProgress, final long tickInterval, final boolean createFakeTick) {
-        if (this.timeData.isEmpty() && inProgress == null) {
-            return null;
-        }
-
-        final List<TickTime> allData = new ArrayList<>(this.timeData);
-        if (inProgress != null) {
-            allData.add(inProgress);
-        }
-
-        final List<TickInformation> collapsedData = collapseData(allData, tickInterval, createFakeTick);
-        if (collapsedData.isEmpty()) {
-            return null;
-        }
-
-        long totalTimeBetweenTicks = 0L;
-        int collectedTicks = 0;
-        for (final TickInformation time : collapsedData) {
-            totalTimeBetweenTicks += time.differenceFromLastTick();
-            ++collectedTicks;
-        }
-        return (double)collectedTicks / ((double)totalTimeBetweenTicks / 1.0E9);
-    }
-
-    public record MSPTData(double avg, long[] rawData) {}
 
     public MSPTData getMSPTData(final TickTime inProgress, final long tickInterval) {
-        return this.getMSPTData(inProgress, tickInterval, false);
+        return getMSPTData(inProgress, tickInterval, false);
     }
 
-    public MSPTData getMSPTData(final TickTime inProgress, final long tickInterval, final boolean createFakeTick) {
-        if (this.timeData.isEmpty() && inProgress == null) {
-            return null;
+    public MSPTData getMSPTData(TickTime inProgress, long tickInterval, boolean createFakeTick) {
+        TickTime[] times = snapshot();
+        if (times[0] == null && inProgress == null) return null;
+
+        CollapsedData data = collapseData(times, inProgress, tickInterval, createFakeTick);
+        if (data.count == 0) return null;
+
+        long total = 0L;
+        long[] tickTimeCopy = new long[data.count];
+        for (int i = 0; i < data.count; i++) {
+            total += data.tickTimes[i];
+            tickTimeCopy[i] = data.tickTimes[i];
         }
 
-        final List<TickTime> allData = new ArrayList<>(this.timeData);
-        if (inProgress != null) {
-            allData.add(inProgress);
-        }
-
-        final List<TickInformation> collapsedData = collapseData(allData, tickInterval, createFakeTick);
-        if (collapsedData.isEmpty()) {
-            return null;
-        }
-
-        long totalTimeTicking = 0L;
-        int collectedTicks = 0;
-        final long[] timePerTickDataRaw = new long[collapsedData.size()];
-        for (int i = 0; i < collapsedData.size(); ++i) {
-            final TickInformation time = collapsedData.get(i);
-            totalTimeTicking += time.tickTime();
-            timePerTickDataRaw[i] = time.tickTime();
-            ++collectedTicks;
-        }
-        return new MSPTData((double)totalTimeTicking / (double)collectedTicks * 1.0E-6, timePerTickDataRaw);
+        return new MSPTData((double) total / data.count * 1.0E-6, tickTimeCopy);
     }
 
     public TickReportData generateTickReport(final TickTime inProgress, final long endTime, final long tickInterval) {
-        return this.generateTickReport(inProgress, endTime, tickInterval, false);
+        return generateTickReport(inProgress, endTime, tickInterval, false);
     }
 
-    // rets null if there is no data
-    public TickReportData generateTickReport(final TickTime inProgress, final long endTime, final long tickInterval, final boolean createFakeTick) {
-        if (this.timeData.isEmpty() && inProgress == null) {
-            return null;
-        }
+    // rets null if there is no data or data is invalid
+    public TickReportData generateTickReport(TickTime inProgress, long endTime, long tickInterval, boolean createFakeTick) {
+        TickTime[] times = snapshot();
+        if ((times.length == 0 || times[0] == null) && inProgress == null) return null;
 
-        final List<TickTime> allData = new ArrayList<>(this.timeData);
-        if (inProgress != null) {
-            allData.add(inProgress);
-        }
+        CollapsedData data = collapseData(times, inProgress, tickInterval, createFakeTick);
+        if (data.count == 0) return null;
 
-        final List<TickInformation> collapsedData = collapseData(allData, tickInterval, createFakeTick);
-        if (collapsedData.isEmpty()) {
-            return null;
-        }
+        final TickTime firstTick = times[0] != null ? times[0] : inProgress;
+        final TickTime lastTick = times[times.length - 1] != null ? times[times.length - 1] : inProgress;
 
-        final long intervalStart = allData.get(0).tickStart();
-        final long intervalEnd = allData.get(allData.size() - 1).tickEnd();
+        if (firstTick == null || lastTick == null) return null;
 
-        // to make utilisation accurate, we need to take the total time used over the last interval period -
-        // this means if a tick start before the measurement interval, but ends within the interval, then we
-        // only consider the time it spent ticking inside the interval
+        final long intervalStart = firstTick.tickStart();
+        final long intervalEnd = (inProgress != null ? inProgress : lastTick).tickEnd();
+
         long totalTimeOverInterval = 0L;
-        long measureStart = endTime - this.interval;
+        final long measureStart = endTime - this.interval;
+        for (TickTime time : times) {
+            if (time == null) continue;
 
-        for (int i = 0, len = allData.size(); i < len; ++i) {
-            final TickTime time = allData.get(i);
-            if (TimeUtil.compareTimes(time.tickStart(), measureStart) < 0) {
-                final long diff = time.tickEnd() - measureStart;
-                if (diff > 0L) {
-                    totalTimeOverInterval += diff;
-                } // else: the time is entirely out of interval
+            if (time.tickStart() < measureStart) {
+                long diff = time.tickEnd() - measureStart;
+                if (diff > 0L) totalTimeOverInterval += diff;
             } else {
                 totalTimeOverInterval += time.tickLength();
             }
         }
+        if (inProgress != null) {
+            if (inProgress.tickStart() < measureStart) {
+                long diff = inProgress.tickEnd() - measureStart;
+                if (diff > 0L) totalTimeOverInterval += diff;
+            } else {
+                totalTimeOverInterval += inProgress.tickLength();
+            }
+        }
 
-        final int collectedTicks = collapsedData.size();
-        final long[] tickStartToStartDifferences = new long[collectedTicks];
-        final long[] timePerTickDataRaw = new long[collectedTicks];
-        final long[] missingCPUTimeDataRaw = new long[collectedTicks];
-
+        long[] tickStartToStartDifferences = Arrays.copyOf(data.diffFromLast, data.count);
+        long[] timePerTickDataRaw = Arrays.copyOf(data.tickTimes, data.count);
+        long[] missingCPUTimeDataRaw = new long[data.count];
         long totalTimeTicking = 0L;
 
-        int i = 0;
-        for (final TickInformation time : collapsedData) {
-            tickStartToStartDifferences[i] = time.differenceFromLastTick();
-            final long timePerTick = timePerTickDataRaw[i] = time.tickTime();
-            missingCPUTimeDataRaw[i] = Math.max(0L, timePerTick - time.tickTimeCPU());
-
-            ++i;
-
-            totalTimeTicking += timePerTick;
+        for (int i = 0; i < data.count; i++) {
+            missingCPUTimeDataRaw[i] = Math.max(0L, data.tickTimes[i] - data.tickCpuTimes[i]);
+            totalTimeTicking += data.tickTimes[i];
         }
 
         Arrays.sort(tickStartToStartDifferences);
         Arrays.sort(timePerTickDataRaw);
         Arrays.sort(missingCPUTimeDataRaw);
 
-        // Note: computeSegmentData cannot take start == end
-        final int allStart = 0;
-        final int allEnd = collectedTicks;
-        final int percent95BestStart = 0;
-        final int percent95BestEnd = collectedTicks == 1 ? 1 : (int)(0.95 * collectedTicks);
-        final int percent99BestStart = 0;
-        // (int)(0.99 * collectedTicks) == 0 if collectedTicks = 1, so we need to use 1 to avoid start == end
-        final int percent99BestEnd = collectedTicks == 1 ? 1 : (int)(0.99 * collectedTicks);
-        final int percent1WorstStart = (int)(0.99 * collectedTicks);
-        final int percent1WorstEnd = collectedTicks;
-        final int percent5WorstStart = (int)(0.95 * collectedTicks);
-        final int percent5WorstEnd = collectedTicks;
+        final int collectedTicks = data.count;
+        final int percent95BestEnd = collectedTicks == 1 ? 1 : (int) (0.95 * collectedTicks);
+        final int percent99BestEnd = collectedTicks == 1 ? 1 : (int) (0.99 * collectedTicks);
+        final int percent1WorstStart = (int) (0.99 * collectedTicks);
+        final int percent5WorstStart = (int) (0.95 * collectedTicks);
 
         final SegmentedAverage tpsData = computeSegmentedAverage(
             tickStartToStartDifferences,
-            allStart, allEnd,
-            percent99BestStart, percent99BestEnd,
-            percent95BestStart, percent95BestEnd,
-            percent1WorstStart, percent1WorstEnd,
-            percent5WorstStart, percent5WorstEnd,
+            collectedTicks,
+            percent99BestEnd,
+            percent95BestEnd,
+            percent1WorstStart, collectedTicks,
+            percent5WorstStart, collectedTicks,
             true
         );
 
         final SegmentedAverage timePerTickData = computeSegmentedAverage(
             timePerTickDataRaw,
-            allStart, allEnd,
-            percent99BestStart, percent99BestEnd,
-            percent95BestStart, percent95BestEnd,
-            percent1WorstStart, percent1WorstEnd,
-            percent5WorstStart, percent5WorstEnd,
+            collectedTicks,
+            percent99BestEnd,
+            percent95BestEnd,
+            percent1WorstStart, collectedTicks,
+            percent5WorstStart, collectedTicks,
             false
         );
 
         final SegmentedAverage missingCPUTimeData = computeSegmentedAverage(
             missingCPUTimeDataRaw,
-            allStart, allEnd,
-            percent99BestStart, percent99BestEnd,
-            percent95BestStart, percent95BestEnd,
-            percent1WorstStart, percent1WorstEnd,
-            percent5WorstStart, percent5WorstEnd,
+            collectedTicks,
+            percent99BestEnd,
+            percent95BestEnd,
+            percent1WorstStart, collectedTicks,
+            percent5WorstStart, collectedTicks,
             false
         );
 
-        final double utilisation = (double)totalTimeOverInterval / (double)this.interval;
+        final double utilisation = (double) totalTimeOverInterval / (double) this.interval;
 
         return new TickReportData(
             collectedTicks,
@@ -278,69 +202,142 @@ public final class TickData {
             intervalEnd,
             totalTimeTicking,
             utilisation,
-
             tpsData,
             timePerTickData,
             missingCPUTimeData
         );
     }
 
-    private static List<TickInformation> collapseData(final List<TickTime> allData, final long tickInterval, final boolean createFakeTick) {
-        // we only care about ticks, but because of inbetween tick task execution
-        // there will be data in allData that isn't ticks. But, that data cannot
-        // be ignored since it contributes to utilisation.
-        // So, we will "compact" the data by merging any inbetween tick times
-        // the next tick.
-        // If there is no "next tick", then we will create one.
-        final int len = allData.size();
-        final List<TickInformation> collapsedData = new ArrayList<>(len);
+    private static SegmentedAverage computeSegmentedAverage(
+        final long[] data,
+        final int allEnd,
+        final int percent99BestEnd,
+        final int percent95BestEnd,
+        final int percent1WorstStart, final int percent1WorstEnd,
+        final int percent5WorstStart, final int percent5WorstEnd,
+        final boolean inverse
+    ) {
+        return new SegmentedAverage(
+            computeSegmentData(data, 0, allEnd, inverse),
+            computeSegmentData(data, 0, percent99BestEnd, inverse),
+            computeSegmentData(data, 0, percent95BestEnd, inverse),
+            computeSegmentData(data, percent5WorstStart, percent5WorstEnd, inverse),
+            computeSegmentData(data, percent1WorstStart, percent1WorstEnd, inverse),
+            data
+        );
+    }
 
-        long totalTickTime = 0L;
-        long totalCpuTime = 0L;
+    private static SegmentData computeSegmentData(final long[] arr, final int fromIndex, final int toIndex, final boolean inverse) {
+        final int len = toIndex - fromIndex;
+        if (len <= 0) throw new IllegalArgumentException("Invalid segment length: " + len);
+
+        long sum = 0L;
+        long min = Long.MAX_VALUE;
+        long max = Long.MIN_VALUE;
+
+        // compute median
+        long[] segment = Arrays.copyOfRange(arr, fromIndex, toIndex);
+        Arrays.sort(segment);
+        final int middle = segment.length / 2;
+        final double median = (segment.length % 2 == 0)
+            ? (segment[middle - 1] + segment[middle]) / 2.0
+            : segment[middle];
+
+        // compute sum, min, max
+        for (int i = fromIndex; i < toIndex; i++) {
+            long val = arr[i];
+            sum += val;
+            min = Math.min(min, val);
+            max = Math.max(max, val);
+        }
+
+        if (inverse) {
+            // for TPS, invert values
+            return new SegmentData(
+                len,
+                (double) len / ((double) sum / 1.0E9),
+                1.0E9 / median,
+                1.0E9 / max,
+                1.0E9 / min
+            );
+        } else {
+            return new SegmentData(
+                len,
+                (double) sum / len,
+                median,
+                min,
+                max
+            );
+        }
+    }
+
+    // this is micro-optimisation hell but its an extremely hot function
+    private CollapsedData collapseData(final TickTime[] timeData, final TickTime inProgress,
+                                       final long tickInterval, final boolean createFakeTick) {
+        int idx = 0;
+        long totalTickTime = dumbTicksTotalTime;
+        long totalCpuTime = dumbTicksTotalCPUTime;
         TickTime lastActualTick = null;
 
-        for (final TickTime time : allData) {
+        for (TickTime time : timeData) {
+            if (time == null) continue;
+
+            long tickLength = time.tickLength();
+            long tickCpu = time.supportCPUTime() ? time.tickCpuTime() : 0L;
+
             if (!time.isTickExecution()) {
-                totalTickTime += time.tickLength();
-                totalCpuTime += time.supportCPUTime() ? time.tickCpuTime() : 0L;
+                totalTickTime += tickLength;
+                totalCpuTime += tickCpu;
             } else {
-                final long tickCpu = time.supportCPUTime() ? time.tickCpuTime() : 0L;
-
-                collapsedData.add(
-                    new TickInformation(
-                        time.differenceFromLastTick(tickInterval),
-                        time.tickLength() + totalTickTime,
-                        tickCpu + totalCpuTime
-                    )
-                );
-
+                preDiffFromLast[idx] = time.differenceFromLastTick(tickInterval);
+                preTickTimes[idx] = tickLength + totalTickTime;
+                preTickCpuTimes[idx] = tickCpu + totalCpuTime;
+                ++idx;
                 totalTickTime = 0L;
                 totalCpuTime = 0L;
                 lastActualTick = time;
             }
         }
 
-        if (totalTickTime > 0 && createFakeTick) {
-            final long differenceBetweenTicks;
-            if (lastActualTick != null) {
-                differenceBetweenTicks = lastActualTick.tickStart();
-            } else {
-                differenceBetweenTicks = Math.max(tickInterval, totalTickTime);
-            }
+        if (inProgress != null) {
+            long tickLength = inProgress.tickLength();
+            long tickCpu = inProgress.supportCPUTime() ? inProgress.tickCpuTime() : 0L;
 
-            collapsedData.add(
-                new TickInformation(
-                    differenceBetweenTicks,
-                    totalTickTime,
-                    totalCpuTime
-                )
-            );
+            if (!inProgress.isTickExecution()) {
+                totalTickTime += tickLength;
+                totalCpuTime += tickCpu;
+            } else {
+                preDiffFromLast[idx] = inProgress.differenceFromLastTick(tickInterval);
+                preTickTimes[idx] = tickLength + totalTickTime;
+                preTickCpuTimes[idx] = tickCpu + totalCpuTime;
+                ++idx;
+                totalTickTime = 0L;
+                totalCpuTime = 0L;
+                lastActualTick = inProgress;
+            }
         }
 
-        return collapsedData;
+        if (totalTickTime > 0 && createFakeTick) {
+            long diff = lastActualTick != null ? lastActualTick.tickStart() : Math.max(tickInterval, totalTickTime);
+            preDiffFromLast[idx] = diff;
+            preTickTimes[idx] = totalTickTime;
+            preTickCpuTimes[idx] = totalCpuTime;
+            ++idx;
+        }
+
+        return new CollapsedData(preDiffFromLast, preTickTimes, preTickCpuTimes, idx);
     }
 
-    public static final record TickReportData(
+    public record MSPTData(double avg, long[] rawData) {}
+
+    private record CollapsedData(
+        long[] diffFromLast,
+        long[] tickTimes,
+        long[] tickCpuTimes,
+        int count
+    ) {}
+
+    public record TickReportData(
         int collectedTicks,
         long collectedTickIntervalStart,
         long collectedTickIntervalEnd,
@@ -354,7 +351,7 @@ public final class TickData {
         SegmentedAverage missingCPUTimeData
     ) {}
 
-    public static final record SegmentedAverage(
+    public record SegmentedAverage(
         SegmentData segmentAll,
         SegmentData segment99PercentBest,
         SegmentData segment95PercentBest,
@@ -363,7 +360,7 @@ public final class TickData {
         long[] rawData
     ) {}
 
-    public static final record SegmentData(
+    public record SegmentData(
         int count,
         double average,
         double median,

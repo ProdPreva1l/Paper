@@ -32910,10 +32910,10 @@ index 71b8bbeda2fecf930870a9b6e856e20639d31645..91650a92a21fcaac65a5dfcac0cc856b
          return structureTemplate.save(new CompoundTag());
      }
 diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
-index 8afe24c382e18e799101662ccf87022e627770ed..a31ef450a0c8f2929065a3c10e47c14bf5eb30f2 100644
+index 506619927627772782d9552b4aa3360e545b646a..c51b8cd68cb537b42502e18afe01b720b20b1e3e 100644
 --- a/net/minecraft/server/MinecraftServer.java
 +++ b/net/minecraft/server/MinecraftServer.java
-@@ -378,6 +378,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+@@ -365,6 +365,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
      // Paper end - improve tick loop
  
      public static <S extends MinecraftServer> S spin(Function<Thread, S> threadFunction) {
